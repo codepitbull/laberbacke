@@ -44,7 +44,7 @@
   </style>
 </head>
 <body>
-  <h1>kronk-chat <span class="model">[{{.Model}}]</span></h1>
+  <h1>kronk-chat <span class="model">[{{.Model}}]</span>{{with .Speech}} <span class="model">[whisper {{.}}]</span>{{end}}</h1>
   <main>
     <aside class="panel">
       <h2>Sessions</h2>

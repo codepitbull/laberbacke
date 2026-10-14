@@ -34,6 +34,9 @@ type Config struct {
 
 	// ModelName is shown in the page header when the model reports no id.
 	ModelName string
+
+	// SpeechModel names the whisper model, shown next to the chat model.
+	SpeechModel string
 }
 
 type Server struct {
@@ -87,6 +90,7 @@ func (s *Server) page(w http.ResponseWriter, r *http.Request) {
 	data := map[string]any{
 		"ID":       sess.ID,
 		"Model":    cmp.Or(s.Chat.ModelID(), s.ModelName),
+		"Speech":   s.SpeechModel,
 		"Title":    sess.Title,
 		"Entries":  sess.Entries,
 		"Sessions": template.HTML(s.sessionItems(sess.ID)),

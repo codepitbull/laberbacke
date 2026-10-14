@@ -1,0 +1,6 @@
+sessions/
+kronkchat
+*.log
+Makefile
+Dockerfile
+.dockerignore

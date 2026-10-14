@@ -39,22 +39,32 @@ func run() error {
 	addr := flag.String("addr", "localhost:8080", "listen address")
 	dataDir := flag.String("data", "sessions", "directory holding one folder per session")
 	configPath := flag.String("config", "config.yml", "config file; defaults apply if it does not exist")
-	downloadOnly := flag.Bool("download", false, "download libraries and models into kronk_dir, then exit")
+	downloadOnly := flag.Bool("download", false, "download missing libraries and models into kronk_dir, then exit")
+	stageDir := flag.String("stage", "", "copy only the libraries and models in use into this (empty) directory, then exit")
+	offline := flag.Bool("offline", false, "never download; fail if something is missing from kronk_dir")
+	kronkDir := flag.String("kronk-dir", "", "overrides kronk_dir from the config file")
 	flag.Parse()
 
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		return err
 	}
+	if *kronkDir != "" {
+		cfg.KronkDir = *kronkDir
+	}
 	log.Printf("model: %s, speech model: %s, kronk dir: %s", cfg.Model, cfg.SpeechModel, cmp.Or(cfg.KronkDir, "default"))
 
-	inst, err := install(cfg)
+	inst, err := resolve(cfg, *offline)
 	if err != nil {
 		return err
 	}
-	if *downloadOnly {
+	switch {
+	case *stageDir != "":
 		inst.log()
-		log.Print("download complete")
+		return inst.stage(cfg.KronkDir, *stageDir)
+	case *downloadOnly:
+		inst.log()
+		log.Print("kronk dir is complete")
 		return nil
 	}
 
@@ -82,8 +92,9 @@ func run() error {
 	srv := web.New(web.Config{
 		Chat:      chat.New(krn, registry, systemPrompt),
 		Speech:    speech,
-		Sessions:  store,
-		ModelName: cfg.Model,
+		Sessions:    store,
+		ModelName:   cfg.Model,
+		SpeechModel: cfg.SpeechModel,
 	})
 
 	return serve(*addr, srv.Handler(), store.Root())
