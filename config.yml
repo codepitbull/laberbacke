@@ -1,0 +1,6 @@
+# Model to load: a "provider/modelID", a bare model id, or a HuggingFace URL.
+# It is downloaded on first use.
+model: unsloth/Qwen3-0.6B-Q8_0
+
+# Whisper model for speech input (mic button): tiny, base.en, small, large-v3, ...
+speech_model: base.en

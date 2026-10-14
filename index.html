@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{{if .Title}}{{.Title}} · {{end}}Kronk Chat</title>
+  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+  <script src="https://unpkg.com/htmx-ext-sse@2.2.2"></script>
+  <style>
+    :root { --bg: #0d1117; --panel: #161b22; --fg: #c9d1d9; --dim: #8b949e; --accent: #7ee787; --link: #79c0ff; --border: #30363d; }
+    body { background: var(--bg); color: var(--fg); font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+           max-width: 1300px; margin: 1.5rem auto; padding: 0 1rem; }
+    h1 { font-size: 1rem; color: var(--dim); font-weight: normal; margin: 0 0 1rem; }
+    h1 .model { color: var(--accent); margin-left: 1ch; }
+    a { color: var(--link); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    main { display: grid; grid-template-columns: 220px 1fr 240px; gap: 1rem; }
+    @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+    .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: .75rem; height: 75vh; overflow-y: auto; }
+
+    /* Terminal: output and prompt line share one scrolling pane. */
+    #term { cursor: text; }
+    .msg { white-space: pre-wrap; margin: 0 0 .75rem; }
+    .user::before { content: "> "; color: var(--accent); }
+    .user { color: #fff; }
+    .note { color: var(--accent); }
+    .note::before { content: "# "; }
+    form { display: flex; align-items: center; margin: 0; }
+    .prompt { color: var(--accent); margin-right: 1ch; }
+    #mic { background: none; border: 0; padding: 0; margin-right: 1ch; cursor: pointer;
+           color: var(--dim); display: flex; line-height: 0; }
+    #mic:hover { color: var(--fg); }
+    #mic.rec { color: #ff7b72; animation: pulse 1s ease-in-out infinite; }
+    #mic.busy { color: var(--accent); cursor: progress; animation: pulse .5s ease-in-out infinite; }
+    @keyframes pulse { 50% { opacity: .35; } }
+    input { flex: 1; background: transparent; border: 0; outline: 0; padding: 0;
+            color: #fff; font: inherit; caret-color: var(--accent); }
+
+    h2 { font-size: .85rem; color: var(--dim); font-weight: normal; margin: 0 0 .5rem; text-transform: uppercase; }
+    aside ul { margin: 0; padding: 0; list-style: none; }
+    aside li { margin: .25rem 0; word-break: break-word; }
+    aside li::before { content: "- "; color: var(--dim); }
+    #sessions li.current a { color: var(--accent); }
+    .new { display: inline-block; margin-bottom: .5rem; }
+  </style>
+</head>
+<body>
+  <h1>kronk-chat <span class="model">[{{.Model}}]</span></h1>
+  <main>
+    <aside class="panel">
+      <h2>Sessions</h2>
+      <a class="new" href="/">+ new chat</a>
+      <ul id="sessions">{{.Sessions}}</ul>
+    </aside>
+    <section id="term" class="panel">
+      <div id="log">
+        {{- range .Entries}}
+        {{- if eq .Role "user"}}
+        <div class="msg user">{{range .Blocks}}{{.Text}}{{end}}</div>
+        {{- else}}
+        <div class="msg bot">{{range .Blocks}}{{if .Note}}<div class="note">{{.Text}}</div>{{else}}{{.Text}}{{end}}{{end}}</div>
+        {{- end}}
+        {{- end}}
+      </div>
+      <form hx-post="/s/{{.ID}}/chat" hx-target="#log" hx-swap="beforeend"
+            hx-on::after-request="this.reset()">
+        <button type="button" id="mic" title="Speak: click to record, click again to transcribe" aria-label="speech input">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><path d="M12 17v5"/>
+          </svg>
+        </button>
+        <span class="prompt">&gt;</span>
+        <input name="prompt" autocomplete="off" spellcheck="false" autofocus required aria-label="prompt">
+      </form>
+    </section>
+    <aside class="panel">
+      <h2>Documents</h2>
+      <ul id="docs">{{.Docs}}</ul>
+    </aside>
+  </main>
+  <script>
+    const term = document.getElementById("term");
+    const input = term.querySelector("input");
+
+    // Keep the prompt line and newest tokens in view.
+    term.scrollTop = term.scrollHeight;
+    new MutationObserver(() => term.scrollTop = term.scrollHeight)
+      .observe(document.getElementById("log"), { childList: true, subtree: true, characterData: true });
+
+    // Clicking anywhere in the terminal focuses the prompt, unless selecting text.
+    term.addEventListener("click", () => {
+      if (!window.getSelection().toString()) input.focus();
+    });
+
+    // ---- Speech input: record raw audio, send it as WAV, put the text in the prompt.
+
+    const mic = document.getElementById("mic");
+    const transcribeURL = "/s/{{.ID}}/transcribe";
+    let rec = null; // { stream, ctx, chunks } while recording
+
+    // Copies each 128-sample block of the first input channel to the page.
+    const captureWorklet = `registerProcessor("capture", class extends AudioWorkletProcessor {
+      process(inputs) {
+        const ch = inputs[0][0];
+        if (ch) this.port.postMessage(ch.slice(0));
+        return true;
+      }
+    });`;
+
+    mic.addEventListener("click", () => {
+      if (mic.classList.contains("busy")) return;
+      rec ? stopRecording() : startRecording();
+    });
+
+    async function startRecording() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+        });
+        const ctx = new AudioContext();
+        const url = URL.createObjectURL(new Blob([captureWorklet], { type: "text/javascript" }));
+        await ctx.audioWorklet.addModule(url);
+        URL.revokeObjectURL(url);
+
+        const node = new AudioWorkletNode(ctx, "capture");
+        const chunks = [];
+        node.port.onmessage = (e) => chunks.push(e.data);
+        ctx.createMediaStreamSource(stream).connect(node);
+        node.connect(ctx.destination); // keeps the node processing; it outputs silence
+
+        rec = { stream, ctx, chunks };
+        mic.classList.add("rec");
+      } catch (err) {
+        note("mic: " + err.message);
+      }
+    }
+
+    async function stopRecording() {
+      const { stream, ctx, chunks } = rec;
+      rec = null;
+      stream.getTracks().forEach((t) => t.stop());
+      const rate = ctx.sampleRate;
+      await ctx.close();
+
+      mic.classList.replace("rec", "busy");
+      try {
+        const res = await fetch(transcribeURL, {
+          method: "POST",
+          headers: { "Content-Type": "audio/wav" },
+          body: encodeWAV(chunks, rate),
+        });
+        const text = (await res.text()).trim();
+        if (!res.ok) throw new Error(text || res.statusText);
+        if (text) input.value = input.value ? input.value + " " + text : text;
+      } catch (err) {
+        note("mic: " + err.message);
+      } finally {
+        mic.classList.remove("busy");
+        input.focus();
+      }
+    }
+
+    // encodeWAV packs float samples into a 16-bit mono PCM WAV file. The
+    // server resamples to the 16 kHz whisper needs.
+    function encodeWAV(chunks, rate) {
+      const n = chunks.reduce((sum, c) => sum + c.length, 0);
+      const v = new DataView(new ArrayBuffer(44 + n * 2));
+      const str = (o, s) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+      str(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); str(8, "WAVE");
+      str(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+      v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+      str(36, "data"); v.setUint32(40, n * 2, true);
+      let o = 44;
+      for (const c of chunks) for (const s of c) {
+        const x = Math.max(-1, Math.min(1, s));
+        v.setInt16(o, x < 0 ? x * 0x8000 : x * 0x7fff, true);
+        o += 2;
+      }
+      return v.buffer;
+    }
+
+    function note(text) {
+      const div = document.createElement("div");
+      div.className = "msg note";
+      div.textContent = text;
+      document.getElementById("log").append(div);
+    }
+  </script>
+</body>
+</html>
