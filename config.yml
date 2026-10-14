@@ -1,6 +1,10 @@
 # Model to load: a "provider/modelID", a bare model id, or a HuggingFace URL.
-# It is downloaded on first use.
+# It is downloaded on first use (or ahead of time with -download).
 model: unsloth/Qwen3-0.6B-Q8_0
 
 # Whisper model for speech input (mic button): tiny, base.en, small, large-v3, ...
 speech_model: base.en
+
+# Where Kronk keeps libraries and models. Leave empty to use KRONK_BASE_PATH,
+# or ~/.kronk if that is unset.
+kronk_dir: ~/.kronk

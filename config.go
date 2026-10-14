@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"go.yaml.in/yaml/v3"
@@ -27,6 +28,10 @@ type Config struct {
 	// SpeechModel is the whisper model Bucky downloads for speech input,
 	// e.g. "tiny", "base.en" or "large-v3".
 	SpeechModel string `yaml:"speech_model"`
+
+	// KronkDir is where Kronk keeps libraries and models. A leading "~/" is
+	// expanded; empty means KRONK_BASE_PATH, or ~/.kronk if that is unset.
+	KronkDir string `yaml:"kronk_dir"`
 }
 
 // loadConfig reads the config file at path. A missing file yields the
@@ -50,5 +55,22 @@ func loadConfig(path string) (Config, error) {
 
 	cfg.Model = cmp.Or(strings.TrimSpace(cfg.Model), defaultModel)
 	cfg.SpeechModel = cmp.Or(strings.TrimSpace(cfg.SpeechModel), defaultSpeechModel)
+
+	cfg.KronkDir, err = expandHome(strings.TrimSpace(cfg.KronkDir))
+	if err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
+}
+
+// expandHome replaces a leading "~" with the user's home directory.
+func expandHome(path string) (string, error) {
+	if path != "~" && !strings.HasPrefix(path, "~/") {
+		return path, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, path[1:]), nil
 }

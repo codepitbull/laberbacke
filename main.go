@@ -6,6 +6,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"flag"
@@ -38,26 +39,37 @@ func run() error {
 	addr := flag.String("addr", "localhost:8080", "listen address")
 	dataDir := flag.String("data", "sessions", "directory holding one folder per session")
 	configPath := flag.String("config", "config.yml", "config file; defaults apply if it does not exist")
+	downloadOnly := flag.Bool("download", false, "download libraries and models into kronk_dir, then exit")
 	flag.Parse()
 
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		return err
 	}
-	log.Printf("model: %s, speech model: %s", cfg.Model, cfg.SpeechModel)
+	log.Printf("model: %s, speech model: %s, kronk dir: %s", cfg.Model, cfg.SpeechModel, cmp.Or(cfg.KronkDir, "default"))
+
+	inst, err := install(cfg)
+	if err != nil {
+		return err
+	}
+	if *downloadOnly {
+		inst.log()
+		log.Print("download complete")
+		return nil
+	}
 
 	store, err := session.NewStore(*dataDir)
 	if err != nil {
 		return err
 	}
 
-	krn, err := loadModel(cfg.Model)
+	krn, err := loadModel(inst)
 	if err != nil {
 		return err
 	}
 	defer krn.Unload(context.Background())
 
-	speech, err := loadSpeech(cfg.SpeechModel)
+	speech, err := loadSpeech(inst)
 	if err != nil {
 		return err
 	}
