@@ -1,4 +1,5 @@
-package main
+// Package session stores chats on disk, one directory per session UUID.
+package session
 
 import (
 	"encoding/json"
@@ -16,8 +17,10 @@ import (
 )
 
 const (
-	stateFile  = ".session.json" // dotfile: hidden from the documents list
-	transcript = "chat.md"
+	stateFile = ".session.json" // dotfile: hidden from the documents list
+
+	// TranscriptFile is the chat.md transcript kept in every session.
+	TranscriptFile = "chat.md"
 )
 
 // Session is one chat. It lives in <root>/<uuid>/ together with the
@@ -29,7 +32,9 @@ type Session struct {
 	Messages []model.D `json:"messages"` // what the model sees
 	Entries  []Entry   `json:"entries"`  // what the browser shows
 
-	mu  sync.Mutex
+	// Mu guards the fields above and serializes turns in this session.
+	Mu sync.Mutex `json:"-"`
+
 	dir string
 }
 
@@ -45,28 +50,32 @@ type Block struct {
 	Text string `json:"text"`
 }
 
-type sessionStore struct {
+// Store finds and lists sessions below a root directory.
+type Store struct {
 	root string
 
 	mu       sync.Mutex
 	sessions map[string]*Session
 }
 
-func newSessionStore(root string) (*sessionStore, error) {
+func NewStore(root string) (*Store, error) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, err
 	}
-	return &sessionStore{root: root, sessions: map[string]*Session{}}, nil
+	return &Store{root: root, sessions: map[string]*Session{}}, nil
 }
 
-var errBadSession = errors.New("invalid session id")
+// Root is the directory holding all sessions.
+func (s *Store) Root() string { return s.root }
 
-// get returns the session for id, loading it from disk if it exists there.
+var ErrInvalidID = errors.New("invalid session id")
+
+// Get returns the session for id, loading it from disk if it exists there.
 // Unknown but valid ids yield a new, empty session that is only written to
 // disk once it has a message.
-func (s *sessionStore) get(id string) (*Session, error) {
+func (s *Store) Get(id string) (*Session, error) {
 	if u, err := uuid.Parse(id); err != nil || u.String() != id {
-		return nil, errBadSession
+		return nil, ErrInvalidID
 	}
 
 	s.mu.Lock()
@@ -91,17 +100,17 @@ func (s *sessionStore) get(id string) (*Session, error) {
 	return sess, nil
 }
 
-type sessionSummary struct {
+type Summary struct {
 	ID      string
 	Title   string
 	Created time.Time
 }
 
-// list returns the sessions saved on disk, newest first.
-func (s *sessionStore) list() []sessionSummary {
+// List returns the sessions saved on disk, newest first.
+func (s *Store) List() []Summary {
 	dirs, _ := os.ReadDir(s.root)
 
-	var out []sessionSummary
+	var out []Summary
 	for _, d := range dirs {
 		if !d.IsDir() {
 			continue
@@ -110,19 +119,22 @@ func (s *sessionStore) list() []sessionSummary {
 		if err != nil {
 			continue
 		}
-		var sum sessionSummary
+		var sum Summary
 		if json.Unmarshal(data, &sum) == nil && sum.ID == d.Name() {
 			out = append(out, sum)
 		}
 	}
 
-	slices.SortFunc(out, func(a, b sessionSummary) int { return b.Created.Compare(a.Created) })
+	slices.SortFunc(out, func(a, b Summary) int { return b.Created.Compare(a.Created) })
 	return out
 }
 
-// save writes the session state and the chat.md transcript. Callers hold
-// sess.mu.
-func (sess *Session) save() error {
+// Dir is the session's directory; it may not exist before the first Save.
+func (sess *Session) Dir() string { return sess.dir }
+
+// Save writes the session state and the chat.md transcript. Callers hold
+// sess.Mu.
+func (sess *Session) Save() error {
 	if err := os.MkdirAll(sess.dir, 0o700); err != nil {
 		return err
 	}
@@ -135,11 +147,11 @@ func (sess *Session) save() error {
 		return err
 	}
 
-	return os.WriteFile(filepath.Join(sess.dir, transcript), []byte(sess.markdown()), 0o600)
+	return os.WriteFile(filepath.Join(sess.dir, TranscriptFile), []byte(sess.Markdown()), 0o600)
 }
 
-// markdown renders the chat the way the browser shows it.
-func (sess *Session) markdown() string {
+// Markdown renders the chat the way the browser shows it.
+func (sess *Session) Markdown() string {
 	var b strings.Builder
 	b.WriteString("# " + sess.Title + "\n\n")
 	for _, e := range sess.Entries {
@@ -159,21 +171,13 @@ func (sess *Session) markdown() string {
 	return b.String()
 }
 
-// docs opens the session directory for safe, traversal-free file access.
-func (sess *Session) docs() (*os.Root, error) {
-	if err := os.MkdirAll(sess.dir, 0o700); err != nil {
-		return nil, err
-	}
-	return os.OpenRoot(sess.dir)
-}
-
-// docNames lists the session's artifacts, skipping hidden files and the
+// DocNames lists the session's artifacts, skipping hidden files and the
 // chat transcript.
-func (sess *Session) docNames() []string {
+func (sess *Session) DocNames() []string {
 	entries, _ := os.ReadDir(sess.dir)
 	var names []string
 	for _, e := range entries {
-		if !e.IsDir() && !strings.HasPrefix(e.Name(), ".") && e.Name() != transcript {
+		if !e.IsDir() && !strings.HasPrefix(e.Name(), ".") && e.Name() != TranscriptFile {
 			names = append(names, e.Name())
 		}
 	}
