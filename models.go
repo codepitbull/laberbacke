@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -40,7 +41,7 @@ var errMissing = errors.New("not in kronk dir")
 // dir is used as is, without network access; only missing parts are
 // downloaded. With offline set, a missing part is an error instead.
 func resolve(cfg Config, offline bool) (installation, error) {
-	inst, err := locate(cfg)
+	inst, err := locate(cfg, offline)
 	if err == nil {
 		log.Print("all libraries and models found in kronk dir")
 		return inst, nil
@@ -54,9 +55,13 @@ func resolve(cfg Config, offline bool) (installation, error) {
 }
 
 // locate finds the libraries and models in the kronk dir. It only reads the
-// local disk. A stale or missing model index (e.g. after the files were
-// copied from elsewhere) is rebuilt from the files present.
-func locate(cfg Config) (installation, error) {
+// local disk, and only accepts complete models (see complete).
+//
+// Offline, the kronk dir is a staged copy without model indexes, so they are
+// rebuilt from the files present (hashing the chat model). Otherwise the
+// index Kronk's downloader keeps is trusted, as a rebuild would also pick up
+// interrupted downloads.
+func locate(cfg Config, offline bool) (installation, error) {
 	var inst installation
 
 	lb, err := libs.New(libs.WithBasePath(cfg.KronkDir))
@@ -72,10 +77,15 @@ func locate(cfg Config) (installation, error) {
 	if err != nil {
 		return inst, err
 	}
-	mp, err := lookup(func() (models.Path, error) { return mdls.FullPath(cfg.Model) },
-		func() error { return mdls.BuildIndex(kronk.FmtLogger, false) })
+	// A fresh index only marks a model validated after checking its SHA-256
+	// against the sha/ pointer file, so a staged copy is hashed once here.
+	mp, err := lookup(offline, func() (models.Path, error) { return mdls.FullPath(cfg.Model) },
+		func() error { return mdls.BuildIndex(kronk.FmtLogger, true) })
 	if err != nil {
 		return inst, fmt.Errorf("model %s %w", cfg.Model, errMissing)
+	}
+	if err := verified(mp.ModelFiles); err != nil {
+		return inst, fmt.Errorf("model %s: %v, %w", cfg.Model, err, errMissing)
 	}
 	inst.chatModel = mp.ModelFiles
 
@@ -92,7 +102,7 @@ func locate(cfg Config) (installation, error) {
 	if err != nil {
 		return inst, err
 	}
-	bmp, err := lookup(func() (models.Path, error) { return bmdls.FullPath(cfg.SpeechModel) },
+	bmp, err := lookup(offline, func() (models.Path, error) { return bmdls.FullPath(cfg.SpeechModel) },
 		func() error { return bmdls.BuildIndex(bucky.FmtLogger, false) })
 	if err != nil || len(bmp.ModelFiles) == 0 {
 		return inst, fmt.Errorf("speech model %s %w", cfg.SpeechModel, errMissing)
@@ -102,22 +112,54 @@ func locate(cfg Config) (installation, error) {
 	return inst, nil
 }
 
-// lookup finds a model in the index, rebuilding the index once if the model
-// is unknown or its files are gone. models.Path and buckymodels.Path are the
-// same type.
-func lookup(find func() (models.Path, error), reindex func() error) (models.Path, error) {
+// lookup finds a complete model in the index. With reindex allowed, an
+// unknown model triggers one index rebuild. models.Path and buckymodels.Path
+// are the same type.
+func lookup(allowReindex bool, find func() (models.Path, error), reindex func() error) (models.Path, error) {
 	for attempt := range 2 {
 		if attempt == 1 {
+			if !allowReindex {
+				break
+			}
 			if err := reindex(); err != nil {
 				return models.Path{}, err
 			}
 		}
 		mp, err := find()
-		if err == nil && filesExist(mp.ModelFiles) {
+		if err == nil && mp.Validated && filesExist(mp.ModelFiles) {
 			return mp, nil
 		}
 	}
 	return models.Path{}, errMissing
+}
+
+// verified checks each model file against the sha/<file>.verified marker
+// Kronk writes after checking a download's hash. A file without that
+// marker, or of another size, is an interrupted or unverified download.
+// Kronk downloads model files in place, so a partial file looks like a
+// model otherwise.
+func verified(files []string) error {
+	for _, f := range files {
+		dir, name := filepath.Split(f)
+		data, err := os.ReadFile(filepath.Join(dir, "sha", name+".verified"))
+		if err != nil {
+			return fmt.Errorf("%s is not verified", name)
+		}
+		var marker struct {
+			Size int64 `json:"size"`
+		}
+		if err := json.Unmarshal(data, &marker); err != nil {
+			return fmt.Errorf("%s: bad verification marker: %w", name, err)
+		}
+		info, err := os.Stat(f)
+		if err != nil {
+			return err
+		}
+		if info.Size() != marker.Size {
+			return fmt.Errorf("%s is %d bytes, expected %d", name, info.Size(), marker.Size)
+		}
+	}
+	return nil
 }
 
 func filesExist(files []string) bool {
@@ -135,7 +177,7 @@ func filesExist(files []string) bool {
 // install downloads whatever is missing from the kronk dir and verifies the
 // libraries. It loads nothing.
 func install(cfg Config) (installation, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancel()
 
 	var inst installation
@@ -153,7 +195,7 @@ func install(cfg Config) (installation, error) {
 	if err != nil {
 		return inst, err
 	}
-	mp, err := mdls.Download(ctx, kronk.FmtLogger, cfg.Model)
+	mp, err := retry(ctx, func() (models.Path, error) { return mdls.Download(ctx, kronk.FmtLogger, cfg.Model) })
 	if err != nil {
 		return inst, fmt.Errorf("install model %s: %w", cfg.Model, err)
 	}
@@ -172,7 +214,7 @@ func install(cfg Config) (installation, error) {
 	if err != nil {
 		return inst, err
 	}
-	bmp, err := bmdls.Download(ctx, bucky.FmtLogger, cfg.SpeechModel)
+	bmp, err := retry(ctx, func() (models.Path, error) { return bmdls.Download(ctx, bucky.FmtLogger, cfg.SpeechModel) })
 	if err != nil {
 		return inst, fmt.Errorf("install speech model %s: %w", cfg.SpeechModel, err)
 	}
@@ -182,6 +224,30 @@ func install(cfg Config) (installation, error) {
 	inst.speechModel = bmp.ModelFiles[0]
 
 	return inst, nil
+}
+
+// retry runs a model download up to three times. Hugging Face sometimes
+// drops long downloads (HTTP/2 GOAWAY); Kronk restarts the file on retry.
+func retry(ctx context.Context, download func() (models.Path, error)) (models.Path, error) {
+	const attempts = 3
+	var err error
+	for i := 1; i <= attempts; i++ {
+		var mp models.Path
+		if mp, err = download(); err == nil {
+			return mp, nil
+		}
+		if i == attempts || ctx.Err() != nil {
+			break
+		}
+		wait := time.Duration(i) * 10 * time.Second
+		log.Printf("download attempt %d/%d failed, retrying in %s: %v", i, attempts, wait, err)
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return models.Path{}, ctx.Err()
+		}
+	}
+	return models.Path{}, err
 }
 
 func (inst installation) log() {
@@ -236,12 +302,21 @@ func (inst installation) stage(kronkDir, dest string) error {
 // copyFile hard-links src to dst when both are on the same file system and
 // copies it otherwise. Symlinks (e.g. libggml.so -> libggml.so.0) are
 // recreated as symlinks.
+//
+// Staged files must be readable by any user, since the container may run
+// with the host's uid. Files that are not (Kronk writes its .verified
+// markers as 0600) are copied rather than linked and made world-readable,
+// so the original's mode is left alone.
 func copyFile(src, dst string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
 
-	if info, err := os.Lstat(src); err == nil && info.Mode()&fs.ModeSymlink != 0 {
+	info, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&fs.ModeSymlink != 0 {
 		target, err := os.Readlink(src)
 		if err != nil {
 			return err
@@ -249,8 +324,11 @@ func copyFile(src, dst string) error {
 		return os.Symlink(target, dst)
 	}
 
-	if err := os.Link(src, dst); err == nil {
-		return nil
+	worldReadable := info.Mode().Perm()&0o004 != 0
+	if worldReadable {
+		if err := os.Link(src, dst); err == nil {
+			return nil
+		}
 	}
 
 	in, err := os.Open(src)
@@ -259,11 +337,7 @@ func copyFile(src, dst string) error {
 	}
 	defer in.Close()
 
-	info, err := in.Stat()
-	if err != nil {
-		return err
-	}
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
@@ -271,7 +345,14 @@ func copyFile(src, dst string) error {
 		out.Close()
 		return err
 	}
-	return out.Close()
+	if err := out.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(dst, info.Mode().Perm()|0o444); err != nil {
+		return err
+	}
+	// Keep the mtime: Kronk's .verified markers record it to skip rehashing.
+	return os.Chtimes(dst, info.ModTime(), info.ModTime())
 }
 
 // loadModel loads the installed chat model.
@@ -279,7 +360,14 @@ func loadModel(inst installation) (*kronk.Kronk, error) {
 	if err := kronk.Init(kronk.WithLibPath(inst.chatLibs)); err != nil {
 		return nil, fmt.Errorf("init kronk: %w", err)
 	}
-	return kronk.New(model.WithModelFiles(inst.chatModel), model.WithAutoTune(true))
+	// AutoTune can pick a q8_0 V cache together with Flash Attention off
+	// (seen for gpt-oss on CPU), which Kronk then rejects. An f16 V cache is
+	// valid either way; AutoTune still chooses everything else.
+	return kronk.New(
+		model.WithModelFiles(inst.chatModel),
+		model.WithAutoTune(true),
+		model.WithCacheTypeV(model.GGMLTypeF16),
+	)
 }
 
 // loadSpeech loads the installed whisper model.

@@ -1,5 +1,6 @@
-# Build with `make docker`: it stages the libraries and models from your
-# kronk dir into .docker/kronk first, so this build downloads no models.
+# Build with `make docker [CONFIG=...]`: it stages the config into
+# .docker/config.yml and the libraries and models it uses from your kronk
+# dir into .docker/kronk, so this build downloads no models.
 
 # ---- build: a static, CGO-free binary (Kronk loads its native libs via purego)
 FROM golang:1.27-trixie AS build
@@ -29,7 +30,7 @@ COPY --chown=app:app .docker/kronk /opt/kronk
 
 WORKDIR /app
 COPY --from=build /out/kronkchat /app/kronkchat
-COPY config.yml /app/config.yml
+COPY .docker/config.yml /app/config.yml
 
 USER app
 

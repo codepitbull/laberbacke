@@ -1,4 +1,4 @@
 .docker
 sessions
 kronkchat
-server.log
+server*.log

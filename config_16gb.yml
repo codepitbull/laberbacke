@@ -1,0 +1,5 @@
+model: unsloth/gpt-oss-20b-Q8_0
+
+speech_model: base.en
+
+kronk_dir: ~/.kronk

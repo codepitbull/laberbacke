@@ -1,11 +1,13 @@
 IMAGE     ?= kronkchat
 PORT      ?= 8080
 SESSIONS  ?= $(CURDIR)/sessions
-# Kronk cache dir; empty uses kronk_dir from config.yml. Point CI caching here.
+# Config file to run with, or to bake into the image.
+CONFIG    ?= config.yml
+# Kronk cache dir; empty uses kronk_dir from $(CONFIG). Point CI caching here.
 KRONK_DIR ?=
 
-STAGE       := .docker/kronk
-KRONK_FLAGS := $(if $(KRONK_DIR),-kronk-dir $(KRONK_DIR))
+STAGE       := .docker
+KRONK_FLAGS := -config $(CONFIG) $(if $(KRONK_DIR),-kronk-dir $(KRONK_DIR))
 
 .PHONY: build run docker runDocker
 
@@ -16,12 +18,14 @@ build:
 run: build
 	./kronkchat $(KRONK_FLAGS) -addr localhost:$(PORT)
 
-## docker: build the image. Libraries and models come from the kronk dir
-## (downloaded there only if missing); only the ones in use are copied in.
+## docker: build the image for $(CONFIG). Libraries and models come from the
+## kronk dir (downloaded there only if missing); only the ones in use are
+## copied in, together with the config.
 docker: build
-	rm -rf $(STAGE)
+	rm -rf $(STAGE)/kronk $(STAGE)/config.yml
 	KRONK_OS=linux KRONK_ARCH=$$(docker version -f '{{.Server.Arch}}') KRONK_PROCESSOR=cpu \
-		./kronkchat $(KRONK_FLAGS) -stage $(STAGE)
+		./kronkchat $(KRONK_FLAGS) -stage $(STAGE)/kronk
+	cp $(CONFIG) $(STAGE)/config.yml
 	docker build -t $(IMAGE) .
 
 ## runDocker: run the image; sessions are stored in $(SESSIONS) on the host.
